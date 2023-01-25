@@ -25,23 +25,25 @@
 package jdk.tools.jlink.internal.plugins;
 
 import jdk.internal.org.objectweb.asm.ClassReader;
+import jdk.internal.org.objectweb.asm.Opcodes;
+import jdk.internal.org.objectweb.asm.tree.ClassNode;
 import jdk.tools.jlink.plugin.ResourcePool;
 import jdk.tools.jlink.plugin.ResourcePoolBuilder;
 import jdk.tools.jlink.plugin.ResourcePoolEntry;
 
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Map;
 import java.util.Set;
+
+import static jdk.internal.org.objectweb.asm.ClassReader.EXPAND_FRAMES;
 
 /**
  *
  * Dump resources plugin
  */
 public final class SealPlugin extends AbstractPlugin {
-    private final TypeSubclasses globalTypeSubclasses = new TypeSubclasses();
-    private final Map<String, TypeSubclasses> moduleTypeSubclasses = new HashMap<>();
 
     public SealPlugin() {
         super("seal");
@@ -49,79 +51,129 @@ public final class SealPlugin extends AbstractPlugin {
 
     @Override
     public ResourcePool transform(ResourcePool in, ResourcePoolBuilder out) {
-        // Create a mapping of types to their subclasses, grouped by module
-        in.entries().forEach(r -> {
-            if (r.type().equals(ResourcePoolEntry.Type.CLASS_OR_RESOURCE)) {
-                String path = r.path();
-                if (path.endsWith(".class") && !path.endsWith("module-info.class")) {
-                    TypeSubclasses ts = typeSubclassesByModule(r.moduleName());
-                    ClassReader reader = newClassReader(path, r);
-                    String name = fullClassName(path);
-                    globalTypeSubclasses.addSubclass(reader.getSuperName(), name);
-                    ts.addSubclass(reader.getSuperName(), name);
-                    for (String iface : reader.getInterfaces()) {
-                        globalTypeSubclasses.addSubclass(iface, name);
-                        ts.addSubclass(iface, name);
-                    }
-                }
-            }
-        });
+        TypeSubclasses gts = mapTypeSubclasses(in);
+        ModuleClasses gmc = mapModuleClasses(in);
 
-        // Find all types that have no subclasses, they can be marked final
-        in.entries().forEach(r -> {
-            if (r.type().equals(ResourcePoolEntry.Type.CLASS_OR_RESOURCE)) {
-                String path = r.path();
-                if (path.endsWith(".class") && !path.endsWith("module-info.class")) {
-                    String name = fullClassName(path);
-                    Set<String> subclasses = globalTypeSubclasses.getOrDefault(name, Collections.emptySet());
-                    if (subclasses.isEmpty()) {
-                        System.out.printf("MARK FINAL %s\n", name);
-                    }
-                }
+        Stats stats = new Stats();
+        in.transformAndCopy(r -> {
+            if (isClass(r)) {
+                transform(gts, gmc, r, stats);
             }
-        });
+            return r;
+        }, out);
 
-        //in.transformAndCopy(Function.identity(), out);
-        //return out.build();
-        return in;
+        System.out.println("Seal plugin:");
+        stats.print();
+
+        return out.build();
     }
 
-    private TypeSubclasses typeSubclassesByModule(String moduleName) {
-        TypeSubclasses ts = moduleTypeSubclasses.get(moduleName);
-        if (ts == null) {
-            moduleTypeSubclasses.put(moduleName, ts = new TypeSubclasses());
+    // Create a mapping of types to their subclasses
+    private TypeSubclasses mapTypeSubclasses(ResourcePool in) {
+        TypeSubclasses gts = new TypeSubclasses();
+        in.entries().forEach(r -> {
+            if (isClass(r)) {
+                String path = r.path();
+                ClassReader cr = newClassReader(path, r);
+                String name = internalClassName(path);
+                gts.addClass(cr.getSuperName(), name);
+                for (String iface : cr.getInterfaces()) {
+                    gts.addClass(iface, name);
+                }
+            }
+        });
+        return gts;
+    }
+
+    // Create a mapping of modules to their classes
+    private ModuleClasses mapModuleClasses(ResourcePool in) {
+        ModuleClasses gts = new ModuleClasses();
+        in.entries().forEach(r -> {
+            if (isClass(r)) {
+                String name = internalClassName(r.path());
+                gts.addClass(r.moduleName(), name);
+            }
+        });
+        return gts;
+    }
+
+    private void transform(TypeSubclasses gts, ModuleClasses gmc, ResourcePoolEntry r, Stats stats) {
+        String path = r.path();
+        String name = internalClassName(path);
+        ClassReader cr = newClassReader(path, r);
+        ClassNode cn = new ClassNode();
+        cr.accept(cn, 0);
+        boolean modified = false;
+        Set<String> subclasses = gts.getOrDefault(name, Collections.emptySet());
+        if (subclasses.isEmpty()) {
+            stats.noSubclasses++;
+            if ((cn.access & Opcodes.ACC_FINAL) != 0) {
+                // No subclasses and not final, we can mark this class final
+                //cn.access |= Opcodes.ACC_FINAL;
+                modified = true;
+                stats.notFinal++;
+            }
+        } else {
+            if (cn.permittedSubclasses == null || cn.permittedSubclasses.isEmpty()) {
+                stats.notSealed++;
+                // Has subclasses, check if they're all in our module
+                if (gmc.hasClasses(r.moduleName(), subclasses)) {
+                    //cn.permittedSubclasses.addAll(subclasses);
+                    modified = true;
+                    stats.localSubclassesOnly++;
+                }
+            }
         }
-        return ts;
+        stats.total++;
     }
 
-    // Given internal class name this returns the package
-    private static String getPackage(String binaryName) {
-        int index = binaryName.lastIndexOf("/");
-
-        return index == -1 ? "" : binaryName.substring(0, index);
+    // Given class path this removes the module name and the ".class" extension
+    private static String internalClassName(String path) {
+        return path.substring(path.indexOf('/', 1) + 1, path.length() - ".class".length());
     }
 
-    // Given full class name this removes the module name
-    private static String internalClassName(String fullClassName) {
-        return fullClassName.substring(fullClassName.indexOf('/') + 1);
-    }
-
-    // Given class path this removes ".class" but leaves module
-    private static String fullClassName(String path) {
-        return path.substring(1, path.length() - ".class".length());
+    private static boolean isClass(ResourcePoolEntry r) {
+        return r.type().equals(ResourcePoolEntry.Type.CLASS_OR_RESOURCE)
+                && r.path().endsWith(".class")
+                && !r.path().endsWith("module-info.class");
     }
 
     @SuppressWarnings("serial")
-    private static class TypeSubclasses extends HashMap<String, Set<String>> {
-        public TypeSubclasses() {
-        }
-
-        public void addSubclass(String parentClassName, String childClassName) {
-            Set<String> subclasses = get(parentClassName);
-            if (subclasses == null) {
-                put(parentClassName, subclasses = new HashSet<>());
+    private static class CategoryClasses extends HashMap<String, Set<String>> {
+        public void addClass(String categoryName, String className) {
+            Set<String> classes = get(categoryName);
+            if (classes == null) {
+                put(categoryName, classes = new HashSet<>());
             }
-            subclasses.add(childClassName);
+            classes.add(className);
+        }
+    }
+
+    @SuppressWarnings("serial")
+    private static class TypeSubclasses extends CategoryClasses {}
+
+    @SuppressWarnings("serial")
+    private static class ModuleClasses extends CategoryClasses {
+        public boolean hasClasses(String moduleName, Collection<String> classNames) {
+            Set<String> moduleClasses = getOrDefault(moduleName, Collections.emptySet());
+            return classNames.stream().allMatch(moduleClasses::contains);
+        }
+    }
+
+    private static class Stats {
+        public int total;
+        public int noSubclasses;
+        public int notFinal;
+        public int notSealed;
+        public int localSubclassesOnly;
+
+        public void print() {
+            System.out.printf("#Classes found: %d\n", total);
+            System.out.printf("#Classes without subclasses: %d\n", noSubclasses);
+            System.out.printf("#Classes not already final: %d\n", notFinal);
+            System.out.printf("#Classes with subclasses: %d\n", total - noSubclasses);
+            System.out.printf("#Classes not already sealed: %d\n", notSealed);
+            System.out.printf("#Classes with only local subclasses: %d\n", localSubclassesOnly);
         }
     }
 }
