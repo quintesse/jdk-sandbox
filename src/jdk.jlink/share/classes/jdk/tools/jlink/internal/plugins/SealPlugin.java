@@ -48,6 +48,10 @@ import static java.lang.System.Logger.Level.INFO;
 import static java.lang.System.Logger.Level.TRACE;
 import static java.lang.System.Logger.Level.WARNING;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
 /**
  *
  * Dump resources plugin
@@ -61,6 +65,7 @@ public final class SealPlugin extends AbstractPlugin {
     private Set<String> acceptedModules = null;
     private boolean markFinal = true;
     private boolean markSealed = true;
+    private Set<String> excludes = new HashSet<>();
 
     private static System.Logger.Level logLevel = WARNING;
 
@@ -77,6 +82,12 @@ public final class SealPlugin extends AbstractPlugin {
         }
         markFinal = config.getOrDefault("final", "y").equals("y");
         markSealed = config.getOrDefault("sealed", "y").equals("y");
+        if (config.containsKey("excludefile")) {
+            Path f = Path.of(config.get("excludefile"));
+            try {
+                excludes.addAll(Files.readAllLines(f));
+            } catch (IOException ex) {}
+        }
         logLevel = System.Logger.Level.valueOf(config.getOrDefault("log", "WARNING").toUpperCase());
     }
 
@@ -191,10 +202,19 @@ public final class SealPlugin extends AbstractPlugin {
     // Naive implementation that checks if the target class is accessible from the source class
     // (both classes must be in the same module)
     private boolean isAccessible(ResourcePoolModule module, String sourceClassName, String targetClassName) {
-        if (targetClassName.contains("$")) {
-            // A hack that filters out some unwanted cases
+        String nm = targetClassName.replace("/", ".");
+        if (excludes.contains(nm)) {
+            log(DEBUG, "Excluded %s", targetClassName);
             return false;
         }
+        if (nm.contains("$")) {
+            nm = nm.substring(0, targetClassName.indexOf("$"));
+            if (excludes.contains(nm)) {
+                log(DEBUG, "Excluded %s", targetClassName);
+                return false;
+            }
+        }
+
         if (!getPackage(sourceClassName).equals(getPackage(targetClassName))) {
             // If they're from different packages we check if the target is public
             String path = "/" + module.name() + "/" + targetClassName + ".class";
