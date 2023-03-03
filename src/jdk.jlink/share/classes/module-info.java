@@ -55,6 +55,8 @@ module jdk.jlink {
     requires jdk.internal.opt;
     requires jdk.jdeps;
 
+    exports jdk.tools.jlink.plugin;
+
     uses jdk.tools.jlink.plugin.Plugin;
 
     provides java.util.spi.ToolProvider with
